@@ -71,7 +71,7 @@ REMOTE_FIG_SUBFOLDER = "Shom/figs"
 #: notebook carries paths rather than data
 SERIES_CACHE = FIG_ROOT / "series"
 MAP_CACHE = FIG_ROOT / "multiband"
-DATAFLOW_PNG = FIG_ROOT / "D321.png"
+DATAFLOW_PNG = Path(os.environ.get("FOCCUS_DATAFLOW", "D321.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -158,22 +158,16 @@ MAP_SOURCES = {
     "model": "Tolosa-SW raw",
     "correction": "Correction (EOF/CCA [20,128] d)",
     "corr_plus_model": "Tolosa-SW corrected",
-    "residual": "Residual after correction",
-    "sat": "Reference L4 (DUACS)",
 }
 MAP_DEFAULT_LEFT = "model"
 MAP_DEFAULT_RIGHT = "corr_plus_model"
 
-#: sources whose comparator maps are on the bucket; the others are rendered
-#: locally by :func:`build_map_cache` when the comparator needs them
-REMOTE_MAP_SOURCES = [s for s in MAP_SOURCES
-                      if s not in ("sat", "residual")]
 
 #: Sources in one group share one symmetric colour range over every date, so
 #: two panels can be compared by eye and the scale does not move with the slider.
 MAP_GROUPS = {
-    "state":  {"sources": ("model", "corr_plus_model", "sat"), "cmap": "balance"},
-    "signal": {"sources": ("bias_ref", "correction", "residual"), "cmap": "diff"},
+    "state":  {"sources": ("model", "corr_plus_model"), "cmap": "balance"},
+    "signal": {"sources": ("bias_ref", "correction"), "cmap": "diff"},
 }
 SKILL_CMAP = "delta"
 
@@ -242,12 +236,14 @@ def remote_manifest() -> list:
     """Files the notebook reads, as paths relative to :data:`DATA_ROOT`.
 
     Object storage has no folders, so each file is named: the field stores
-    and the mesh, then per station the gauge record and its scores. Stations
-    without a record simply are not on the bucket, which
-    :func:`download_data` reports rather than treats as a failure.
+    and the mesh, then per station the gauge record and its scores. The
+    stores go beyond the comparator sources — ``residual`` and ``sat`` feed
+    the domain scores and the external diagnostics. Stations without a
+    record simply are not on the bucket, which :func:`download_data`
+    reports rather than treats as a failure.
     """
-    out = [f"{FIELDS_DIR.name}/{n}{FIELD_EXT}"
-           for n in (*MAP_SOURCES, "skill", "_mesh")]
+    stores = [*MAP_SOURCES, "residual", "sat", "skill", "_mesh"]
+    out = [f"{FIELDS_DIR.name}/{n}{FIELD_EXT}" for n in stores]
     for st in STATIONS:
         out.append(f"{PORTS_DIR.name}/validation_{st}.parquet")
         out.append(f"{PORTS_DIR.name}/scores_{st}.json")
@@ -257,16 +253,15 @@ def remote_manifest() -> list:
 def remote_fig_manifest() -> list:
     """Cached renders the notebook reads, relative to :data:`FIG_ROOT`.
 
-    The per-station series the explorer fetches, and the comparator maps of
-    :data:`REMOTE_MAP_SOURCES`, one PNG per source and per date. The dates
-    are read from the field stores, so this list is only complete once they
-    are on disk.
+    The comparator maps, one PNG per source and per date, and their colour
+    ranges. The per-station series are not on the bucket: the explorer
+    rebuilds them from the Parquet records. The dates are read from the
+    field stores, so this list is only complete once they are on disk.
     """
     import pandas as pd
 
-    out = [f"{SERIES_CACHE.name}/{st}.json" for st in STATIONS]
-    out.append(f"{MAP_CACHE.name}/_vlim.json")
-    for src in REMOTE_MAP_SOURCES:
+    out = [f"{MAP_CACHE.name}/_vlim.json"]
+    for src in MAP_SOURCES:
         try:
             ds = open_field(src)
             dates = sorted({d.strftime("%Y-%m-%d")
@@ -279,16 +274,43 @@ def remote_fig_manifest() -> list:
 
 def _fetch(files, subfolder, out_dir, batch):
     """Download `files` from `subfolder` into `out_dir`; return those that
-    did not arrive."""
+    did not arrive.
+
+    The destination folders are created first: the downloader writes into
+    them but does not make them, and a missing one raises FileNotFoundError
+    on a fresh checkout. A batch that fails is reported and the next one is
+    still attempted.
+    """
     from download_from_s3 import download_files_from_s3
 
+    out_dir = Path(out_dir)
+    for f in files:
+        (out_dir / f).parent.mkdir(parents=True, exist_ok=True)
     for k in range(0, len(files), batch):
-        download_files_from_s3(
-            files_to_download=files[k:k + batch],
-            s3_subfolder=subfolder,
-            local_output_dir=str(out_dir),
-        )
-    return [f for f in files if not (Path(out_dir) / f).exists()]
+        chunk = files[k:k + batch]
+        try:
+            download_files_from_s3(
+                files_to_download=chunk,
+                s3_subfolder=subfolder,
+                local_output_dir=str(out_dir),
+            )
+        except Exception as exc:
+            # le module s'arrête au premier objet absent : on reprend le lot
+            # fichier par fichier pour ne pas perdre les suivants
+            print(f"  [warn] {type(exc).__name__} on a batch from "
+                  f"{subfolder} ({exc}) — retrying file by file")
+            for one in chunk:
+                if (out_dir / one).exists():
+                    continue
+                try:
+                    download_files_from_s3(
+                        files_to_download=[one],
+                        s3_subfolder=subfolder,
+                        local_output_dir=str(out_dir),
+                    )
+                except Exception:
+                    pass
+    return [f for f in files if not (out_dir / f).exists()]
 
 
 def _report(kind, asked, missing):
