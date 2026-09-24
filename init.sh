@@ -32,7 +32,6 @@ conda install -y -c conda-forge mamba
 ### === Install exact packages ===
 echo "📦 Installing required packages..."
 mamba install -y -c conda-forge \
-  json==0.15.0 \
   pandas==2.2.3 \
   numpy==2.5.0 \
   matplotlib==3.11.0 \
