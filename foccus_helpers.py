@@ -61,8 +61,9 @@ MESH_FILE = FIELDS_DIR / "_mesh.nc"
 COASTLINE_FILE = Path(os.environ.get("FOCCUS_COASTLINE",
                                      str(DATA_ROOT / "coastline.shp")))
 
-#: bucket subfolder holding everything :func:`download_data` fetches
-REMOTE_SUBFOLDER = "Shom/data"
+#: bucket subfolders :func:`download_data` fetches from, one per local root
+REMOTE_SUBFOLDER = "Shom/data/"
+REMOTE_FIG_SUBFOLDER = "Shom/figs/"
 
 #: built, not authored: per-station series fetched by the explorer, and the
 #: rendered maps served to the comparator — both by relative path, so the
@@ -247,34 +248,82 @@ def remote_manifest() -> list:
     return out
 
 
-def download_data(content=None, force=False, batch=40):
+def remote_fig_manifest() -> list:
+    """Cached renders the notebook reads, relative to :data:`FIG_ROOT`.
+
+    The per-station series the explorer fetches, and the comparator maps,
+    one PNG per source and per date. The dates are read from the field
+    stores, so this list is only complete once they are on disk.
+    """
+    import pandas as pd
+
+    out = [f"{SERIES_CACHE.name}/{st}.json" for st in STATIONS]
+    out.append(f"{MAP_CACHE.name}/_vlim.json")
+    for src in MAP_SOURCES:
+        try:
+            ds = open_field(src)
+            dates = sorted({d.strftime("%Y-%m-%d")
+                            for d in pd.to_datetime(ds["time"].values)})
+        except Exception:
+            continue
+        out += [f"{MAP_CACHE.name}/{src}/{src}_{d}.png" for d in dates]
+    return out
+
+
+def _fetch(files, subfolder, out_dir, batch):
+    """Download `files` from `subfolder` into `out_dir`; return those that
+    did not arrive."""
+    from download_from_s3 import download_files_from_s3
+
+    for k in range(0, len(files), batch):
+        download_files_from_s3(
+            files_to_download=files[k:k + batch],
+            s3_subfolder=subfolder,
+            local_output_dir=str(out_dir),
+        )
+    return [f for f in files if not (Path(out_dir) / f).exists()]
+
+
+def _report(kind, asked, missing):
+    print(f"{kind}: {asked - len(missing)} file(s) fetched.")
+    if missing:
+        head = ", ".join(missing[:4])
+        more = f", … (+{len(missing) - 4})" if len(missing) > 4 else ""
+        print(f"  not on the bucket ({len(missing)}): {head}{more}")
+
+
+def download_data(content=None, force=False, figures=True, batch=40):
     """Fetch from the shared bucket whatever the notebook needs and lacks.
 
     ``content`` overrides :func:`remote_manifest`; ``force`` downloads files
-    already present. Nothing is fetched twice, so the call is safe to leave
-    at the top of the notebook. Files absent from the bucket are listed at
-    the end: three stations have no record yet, and their absence is normal.
+    already present; ``figures`` also brings the cached renders of
+    :func:`remote_fig_manifest`, which spares rebuilding the comparator maps
+    locally. Nothing is fetched twice, so the call is safe to leave at the
+    top of the notebook. Files absent from the bucket are reported rather
+    than treated as a failure: three stations have no record yet, and the
+    renders may simply not have been uploaded.
     """
-    from download_from_s3 import download_files_from_s3
-
     wanted = list(remote_manifest() if content is None else content)
-    missing = wanted if force else [c for c in wanted
-                                    if not (DATA_ROOT / c).exists()]
-    if not missing:
+    todo = wanted if force else [c for c in wanted
+                                 if not (DATA_ROOT / c).exists()]
+    if todo:
+        print(f"Fetching {len(todo)} file(s) → {DATA_ROOT}/ …")
+        _report("Data", len(todo),
+                _fetch(todo, REMOTE_SUBFOLDER, DATA_ROOT, batch))
+    else:
         print(f"Data already in place under {DATA_ROOT}/.")
+
+    if not figures or content is not None:
         return
-    print(f"Fetching {len(missing)} file(s) → {DATA_ROOT}/ …")
-    for k in range(0, len(missing), batch):
-        download_files_from_s3(
-            files_to_download=missing[k:k + batch],
-            s3_subfolder=REMOTE_SUBFOLDER,
-            local_output_dir=str(DATA_ROOT),
-        )
-    still = [c for c in missing if not (DATA_ROOT / c).exists()]
-    got = len(missing) - len(still)
-    print(f"Download complete: {got} file(s) fetched.")
-    if still:
-        print(f"  not on the bucket ({len(still)}): {', '.join(still)}")
+    figs = remote_fig_manifest()
+    todo = figs if force else [f for f in figs
+                               if not (FIG_ROOT / f).exists()]
+    if not todo:
+        print(f"Cached renders already in place under {FIG_ROOT}/.")
+        return
+    print(f"Fetching {len(todo)} cached render(s) → {FIG_ROOT}/ …")
+    _report("Renders", len(todo),
+            _fetch(todo, REMOTE_FIG_SUBFOLDER, FIG_ROOT, 200))
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +439,21 @@ def _series_signature() -> str:
     return hashlib.md5(payload).hexdigest()[:12]
 
 
+def _looks_like_json(path: Path) -> bool:
+    """First non-blank byte of a cached series file.
+
+    A JSON fetched from the bucket can arrive truncated, or as an error page
+    served in its place; both parse as nothing in the browser, so the file is
+    rebuilt from the Parquet rather than served as is.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(64).lstrip()
+        return head[:1] in (b"{", b"[")
+    except Exception:
+        return False
+
+
 def _export_series() -> dict:
     """Write one JSON per station under :data:`SERIES_CACHE`; ``{station: Path}``.
 
@@ -406,10 +470,15 @@ def _export_series() -> dict:
     out, written, failed = {}, 0, 0
     for name, src in station_files().items():
         dest = SERIES_CACHE / f"{name}.json"
-        if (not stale and dest.exists()
+        if (not stale and dest.exists() and dest.stat().st_size > 0
                 and dest.stat().st_mtime >= src.stat().st_mtime):
-            out[name] = dest
-            continue
+            if _looks_like_json(dest):
+                out[name] = dest
+                continue
+            with open(dest, "rb") as fh:
+                head = fh.read(40).decode("utf-8", "replace").strip()
+            print(f"  [warn] {dest.name} is not JSON (starts with "
+                  f"{head[:30]!r}) — rebuilding it from the Parquet")
         try:
             with open(dest, "w") as fh:
                 json.dump(_series_payload(src), fh, separators=(",", ":"))
@@ -420,6 +489,9 @@ def _export_series() -> dict:
             print(f"  [warn] {name}: {exc}")
     if written and not failed:
         sig_file.write_text(sig)
+    if written:
+        print(f"  series cache: {written} station(s) written under "
+              f"{SERIES_CACHE}/")
     return out
 
 
@@ -625,14 +697,30 @@ def plot_timeseries_explorer():
     _ensure_setup()
     from IPython.display import HTML, display
 
+    if not station_files():
+        print(f"No gauge record under {PORTS_DIR}/ — run fh.download_data() "
+              f"first.")
+        return
+
     cwd = Path.cwd()
-    manifest = {}
+    manifest, outside = {}, []
     for name, dest in _export_series().items():
         try:
             url = os.path.relpath(Path(dest).resolve(), cwd)
         except ValueError:                      # different drive / mount
             url = str(Path(dest).resolve())
+        if url.startswith(".."):
+            outside.append(url)
         manifest[name] = {"url": url}
+    if not manifest:
+        print(f"Could not build the series cache under {SERIES_CACHE}/ — "
+              f"check that the Parquet files are readable, or fetch the "
+              f"cache with fh.download_data().")
+        return
+    if outside:
+        print(f"  [warn] the series cache sits outside the notebook "
+              f"directory ({outside[0]}); the browser cannot fetch it. Set "
+              f"FOCCUS_FIG_ROOT to a path under the notebook.")
 
     colors = {REF_SERIES: C_OBS, RAW_SERIES: C_RAW, COR_SERIES: C_COR}
     config = json.dumps({"ref": REF_SERIES, "height": 380, "colors": colors})
