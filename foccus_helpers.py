@@ -61,10 +61,8 @@ MESH_FILE = FIELDS_DIR / "_mesh.nc"
 COASTLINE_FILE = Path(os.environ.get("FOCCUS_COASTLINE",
                                      str(DATA_ROOT / "coastline.shp")))
 
-#: what :func:`download_data` fetches under :data:`DATA_ROOT`: folders are
-#: recreated as they are, so the list follows the layout, not the file names
-REMOTE_SUBFOLDER = "Shom/data/"
-REMOTE_CONTENT = ["ports", "fields"]
+#: bucket subfolder holding everything :func:`download_data` fetches
+REMOTE_SUBFOLDER = "Shom/data"
 
 #: built, not authored: per-station series fetched by the explorer, and the
 #: rendered maps served to the comparator — both by relative path, so the
@@ -158,6 +156,8 @@ MAP_SOURCES = {
     "model": "Tolosa-SW raw",
     "correction": "Correction (EOF/CCA [20,128] d)",
     "corr_plus_model": "Tolosa-SW corrected",
+    "residual": "Residual after correction",
+    "sat": "Reference L4 (DUACS)",
 }
 MAP_DEFAULT_LEFT = "model"
 MAP_DEFAULT_RIGHT = "corr_plus_model"
@@ -231,34 +231,50 @@ def _placeholder(ax, msg):
             bbox=dict(boxstyle="round", fc="#f4f4f4", ec="#ccc"))
 
 
-def download_data(content=None, force=False):
-    """Fetch from the shared bucket whatever is missing under ``data/``.
+def remote_manifest() -> list:
+    """Files the notebook reads, as paths relative to :data:`DATA_ROOT`.
 
-    The notebook reads the gauge records under ``ports/`` and the field
-    stores under ``fields/``; ``content`` overrides that list, with folder
-    names recreated as they are. Nothing already present is downloaded
-    again unless ``force`` is set, so the call is safe to leave at the top
-    of the notebook.
+    Object storage has no folders, so each file is named: the field stores
+    and the mesh, then per station the gauge record and its scores. Stations
+    without a record simply are not on the bucket, which
+    :func:`download_data` reports rather than treats as a failure.
+    """
+    out = [f"{FIELDS_DIR.name}/{n}{FIELD_EXT}"
+           for n in (*MAP_SOURCES, "skill", "_mesh")]
+    for st in STATIONS:
+        out.append(f"{PORTS_DIR.name}/validation_{st}.parquet")
+        out.append(f"{PORTS_DIR.name}/scores_{st}.json")
+    return out
+
+
+def download_data(content=None, force=False, batch=40):
+    """Fetch from the shared bucket whatever the notebook needs and lacks.
+
+    ``content`` overrides :func:`remote_manifest`; ``force`` downloads files
+    already present. Nothing is fetched twice, so the call is safe to leave
+    at the top of the notebook. Files absent from the bucket are listed at
+    the end: three stations have no record yet, and their absence is normal.
     """
     from download_from_s3 import download_files_from_s3
 
-    wanted = list(REMOTE_CONTENT if content is None else content)
+    wanted = list(remote_manifest() if content is None else content)
     missing = wanted if force else [c for c in wanted
                                     if not (DATA_ROOT / c).exists()]
     if not missing:
         print(f"Data already in place under {DATA_ROOT}/.")
         return
-    print(f"Fetching {', '.join(missing)} → {DATA_ROOT}/ …")
-    download_files_from_s3(
-        files_to_download=missing,
-        s3_subfolder=REMOTE_SUBFOLDER,
-        local_output_dir=str(DATA_ROOT),
-    )
+    print(f"Fetching {len(missing)} file(s) → {DATA_ROOT}/ …")
+    for k in range(0, len(missing), batch):
+        download_files_from_s3(
+            files_to_download=missing[k:k + batch],
+            s3_subfolder=REMOTE_SUBFOLDER,
+            local_output_dir=str(DATA_ROOT),
+        )
     still = [c for c in missing if not (DATA_ROOT / c).exists()]
+    got = len(missing) - len(still)
+    print(f"Download complete: {got} file(s) fetched.")
     if still:
-        print(f"  [warn] still missing after download: {', '.join(still)}")
-    else:
-        print("Download complete.")
+        print(f"  not on the bucket ({len(still)}): {', '.join(still)}")
 
 
 # ---------------------------------------------------------------------------

@@ -44,6 +44,7 @@ mamba install -y -c conda-forge \
   zarr==3.2.1 \
   ipywidgets==8.0.0 \
   Shapely==2.1.2 \
+  pyarrow \   
   ipykernel jupyter nbformat nbconvert s3fs
 
 ### === Register kernel for Jupyter ===
