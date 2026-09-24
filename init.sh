@@ -36,6 +36,7 @@ mamba install -y -c conda-forge \
   numpy==2.5.0 \
   matplotlib==3.11.0 \
   geopandas \
+  pyarrow \
   cartopy==0.25.0 \
   xarray==2026.4.0 \
   cmocean==4.0.3 \
@@ -44,7 +45,6 @@ mamba install -y -c conda-forge \
   zarr==3.2.1 \
   ipywidgets==8.0.0 \
   Shapely==2.1.2 \
-  pyarrow \   
   ipykernel jupyter nbformat nbconvert s3fs
 
 ### === Register kernel for Jupyter ===
