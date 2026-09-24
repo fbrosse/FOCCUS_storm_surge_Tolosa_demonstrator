@@ -53,9 +53,9 @@ python -m ipykernel install --user --name foccus_tolosa --display-name "Python (
 
 ### === Download notebook and helper script ===
 echo "📥 Downloading notebook and script..."
-wget -N https://github.com/fbrosse/FOCCUS_storm_surge_Tolosa_demonstrator/main.ipynb
-wget -N https://github.com/fbrosse/FOCCUS_storm_surge_Tolosa_demonstrator/foccus_helpers.py
-wget -N https://github.com/fbrosse/FOCCUS_storm_surge_Tolosa_demonstrator/download_from_s3.py
+wget -N https://github.com/fbrosse/FOCCUS_storm_surge_Tolosa_demonstrator/blob/main/main.ipynb
+wget -N https://github.com/fbrosse/FOCCUS_storm_surge_Tolosa_demonstrator/blob/main/foccus_helpers.py
+wget -N https://github.com/fbrosse/FOCCUS_storm_surge_Tolosa_demonstrator/blob/main/download_from_s3.py
 
 ### === Embed kernel metadata ===
 echo "⚙️ Embedding kernel metadata into notebook..."
@@ -83,14 +83,14 @@ echo "✅ Setup complete. You can now open main.ipynb and it will use the 'foccu
 ### === Download input ===
 
 # Dataflow
-wget -N https://github.com/fbrosse/FOCCUS_storm_surge_Tolosa_demonstrator/figs/D321.png
+wget -N https://github.com/fbrosse/FOCCUS_storm_surge_Tolosa_demonstrator/blob/main/figs/D321.png
 
 # Logos
 mkdir -p logos
 cd logos
 
 # Base path to raw files on GitHub
-BASE_URL="https://github.com/fbrosse/FOCCUS_storm_surge_Tolosa_demonstrator/logos"
+BASE_URL="https://github.com/fbrosse/FOCCUS_storm_surge_Tolosa_demonstrator/blob/main/logos"
 
 # List of files to download
 FILES=(
