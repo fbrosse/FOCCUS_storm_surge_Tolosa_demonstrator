@@ -31,8 +31,8 @@ def download_files_from_s3(
     for file in files_to_download:
         s3_path = f"{bucket_name}/{s3_subfolder}/{file}"
         local_path = join(local_output_dir, file)
-        try:
-            fs.download(s3_path, local_path)
-            print(f"✅ Downloaded: {s3_path} → {local_path}")
-        except Exception as e:
-            print(f"❌ Failed to download {s3_path}: {e}")
+        # try:
+        fs.download(s3_path, local_path)
+        #     print(f"✅ Downloaded: {s3_path} → {local_path}")
+        # except Exception as e:
+        #     print(f"❌ Failed to download {s3_path}: {e}")

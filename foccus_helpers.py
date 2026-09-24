@@ -61,9 +61,10 @@ MESH_FILE = FIELDS_DIR / "_mesh.nc"
 COASTLINE_FILE = Path(os.environ.get("FOCCUS_COASTLINE",
                                      str(DATA_ROOT / "coastline.shp")))
 
-#: bucket subfolders :func:`download_data` fetches from, one per local root
-REMOTE_SUBFOLDER = "Shom/data/"
-REMOTE_FIG_SUBFOLDER = "Shom/figs/"
+#: bucket subfolders :func:`download_data` fetches from, one per local root;
+#: no trailing slash, the downloader chokes on it
+REMOTE_SUBFOLDER = "Shom/data"
+REMOTE_FIG_SUBFOLDER = "Shom/figs"
 
 #: built, not authored: per-station series fetched by the explorer, and the
 #: rendered maps served to the comparator — both by relative path, so the
@@ -163,6 +164,11 @@ MAP_SOURCES = {
 MAP_DEFAULT_LEFT = "model"
 MAP_DEFAULT_RIGHT = "corr_plus_model"
 
+#: sources whose comparator maps are on the bucket; the others are rendered
+#: locally by :func:`build_map_cache` when the comparator needs them
+REMOTE_MAP_SOURCES = [s for s in MAP_SOURCES
+                      if s not in ("sat", "residual")]
+
 #: Sources in one group share one symmetric colour range over every date, so
 #: two panels can be compared by eye and the scale does not move with the slider.
 MAP_GROUPS = {
@@ -251,15 +257,16 @@ def remote_manifest() -> list:
 def remote_fig_manifest() -> list:
     """Cached renders the notebook reads, relative to :data:`FIG_ROOT`.
 
-    The per-station series the explorer fetches, and the comparator maps,
-    one PNG per source and per date. The dates are read from the field
-    stores, so this list is only complete once they are on disk.
+    The per-station series the explorer fetches, and the comparator maps of
+    :data:`REMOTE_MAP_SOURCES`, one PNG per source and per date. The dates
+    are read from the field stores, so this list is only complete once they
+    are on disk.
     """
     import pandas as pd
 
     out = [f"{SERIES_CACHE.name}/{st}.json" for st in STATIONS]
     out.append(f"{MAP_CACHE.name}/_vlim.json")
-    for src in MAP_SOURCES:
+    for src in REMOTE_MAP_SOURCES:
         try:
             ds = open_field(src)
             dates = sorted({d.strftime("%Y-%m-%d")
@@ -687,12 +694,18 @@ def plot_station_map():
 # Track A — time-series explorer
 # ---------------------------------------------------------------------------
 
-def plot_timeseries_explorer():
+def plot_timeseries_explorer(inline=False):
     """Interactive per-station surge explorer (uPlot).
 
     Drag to zoom, double-click to reset; the statistics under the plot are
     recomputed over the visible window against the observed surge. Each
-    station's series is fetched from :data:`SERIES_CACHE` when selected.
+    station's series is fetched from :data:`SERIES_CACHE` when selected,
+    through the server's ``files/`` endpoint and, failing that, by path
+    relative to the notebook.
+
+    ``inline`` embeds every series in the cell output instead, which no
+    longer depends on how the server exposes files — at the price of a
+    notebook heavy by several megabytes per station.
     """
     _ensure_setup()
     from IPython.display import HTML, display
@@ -712,15 +725,24 @@ def plot_timeseries_explorer():
         if url.startswith(".."):
             outside.append(url)
         manifest[name] = {"url": url}
+        if inline:
+            try:
+                manifest[name]["payload"] = json.loads(Path(dest).read_text())
+            except Exception as exc:
+                print(f"  [warn] {name}: {exc}")
     if not manifest:
         print(f"Could not build the series cache under {SERIES_CACHE}/ — "
               f"check that the Parquet files are readable, or fetch the "
               f"cache with fh.download_data().")
         return
-    if outside:
+    if outside and not inline:
         print(f"  [warn] the series cache sits outside the notebook "
               f"directory ({outside[0]}); the browser cannot fetch it. Set "
-              f"FOCCUS_FIG_ROOT to a path under the notebook.")
+              f"FOCCUS_FIG_ROOT to a path under the notebook, or call this "
+              f"function with inline=True.")
+    if inline:
+        mb = sum(len(json.dumps(m.get("payload", ""))) for m in manifest.values())
+        print(f"  inline: {mb / 1e6:.1f} MB embedded in the cell output")
 
     colors = {REF_SERIES: C_OBS, RAW_SERIES: C_RAW, COR_SERIES: C_COR}
     config = json.dumps({"ref": REF_SERIES, "height": 380, "colors": colors})
@@ -2130,6 +2152,26 @@ _EXPLORER_TMPL = r"""
   }
   names.forEach(function(n){var o=document.createElement("option");o.value=n;o.textContent=n;stationSel.appendChild(o);});
 
+  function fileUrls(rel){
+    // Un chemin relatif ne résout pas dans JupyterLab, où la page vit sous
+    // /lab/tree/… : le serveur renvoie la page HTML de Lab, que le JSON ne
+    // sait pas lire. On essaie d'abord l'endpoint /files/ du serveur.
+    var out=[rel];
+    try{
+      var base=(document.body&&document.body.dataset&&document.body.dataset.baseUrl)||"/";
+      var m=window.location.pathname.match(/\/(?:lab\/tree|notebooks|edit|voila\/render)\/(.*)$/);
+      var dir=m?decodeURIComponent(m[1]).replace(/[^\/]*$/,""):"";
+      out.unshift(base.replace(/\/?$/,"/")+"files/"+dir+rel);
+    }catch(e){}
+    return out;
+  }
+  function fetchFirst(urls,i,ok,ko){
+    if(i>=urls.length){ ko(); return; }
+    fetch(urls[i])
+      .then(function(r){ if(!r.ok) throw new Error(r.status); return r.json(); })
+      .then(ok)
+      .catch(function(){ fetchFirst(urls,i+1,ok,ko); });
+  }
   function ensureUplot(cb){
     if(window.uPlot) return cb();
     var s=document.createElement("script");
@@ -2306,13 +2348,15 @@ _EXPLORER_TMPL = r"""
     plotEl.innerHTML=""; statsBody.innerHTML=""; winEl.textContent="";
     var m=MANIFEST[n];
     if(!m||!m.url){ DATA[n]={error:"no series file for this station"}; finishSelect(); return; }
-    fetch(m.url)
-      .then(function(r){ if(!r.ok) throw new Error(r.status+" "+r.statusText); return r.json(); })
-      .then(function(j){ DATA[n]=decode(j); if(current===n) finishSelect(); })
-      .catch(function(e){
-        DATA[n]={error:"could not load "+m.url+" ("+e.message+"). "
-                      +"The file is served by path relative to the notebook, "
-                      +"like the map cache."};
+    if(m.payload){ DATA[n]=decode(m.payload); finishSelect(); return; }
+    var urls=fileUrls(m.url);
+    fetchFirst(urls,0,
+      function(j){ DATA[n]=decode(j); if(current===n) finishSelect(); },
+      function(){
+        DATA[n]={error:"could not read the series of this station. Tried "
+                      +urls.join(" and ")+". If the server does not serve "
+                      +"these files, call "
+                      +"fh.plot_timeseries_explorer(inline=True)."};
         if(current===n) finishSelect();
       });
   }
@@ -2387,11 +2431,34 @@ _COMPARATOR_TMPL = r"""
   slider.max = Math.max(0, DATES.length-1);
   slider.disabled = DATES.length < 2;
 
+  function fileUrls(rel){
+    var out=[rel];
+    try{
+      var base=(document.body&&document.body.dataset&&document.body.dataset.baseUrl)||"/";
+      var m=window.location.pathname.match(/\/(?:lab\/tree|notebooks|edit|voila\/render)\/(.*)$/);
+      var dir=m?decodeURIComponent(m[1]).replace(/[^\/]*$/,""):"";
+      out.unshift(base.replace(/\/?$/,"/")+"files/"+dir+rel);
+    }catch(e){}
+    return out;
+  }
   function imgHTML(p){
     var src = p.imgs ? p.imgs[DATES[ti]] : null;
     if(!src) return '<div class="missing">No cached map for:<br><b>'+p.label+'</b>'
                     + (DATES.length ? '<br>'+DATES[ti] : '') + '</div>';
-    return '<img src="'+src+'" alt="'+p.label+' '+DATES[ti]+'" loading="lazy">';
+    var u = fileUrls(src);
+    return '<img src="'+u[0]+'" data-fallback="'+(u[1]||"")+'" alt="'
+           +p.label+' '+DATES[ti]+'" loading="lazy">';
+  }
+  function armFallback(stage){
+    // le chemin relatif sert de recours quand /files/ ne répond pas
+    Array.prototype.forEach.call(stage.querySelectorAll("img[data-fallback]"),
+      function(im){
+        im.onerror=function(){
+          var f=im.getAttribute("data-fallback");
+          im.removeAttribute("data-fallback");
+          if(f){ im.src=f; }
+        };
+      });
   }
   function panelHTML(p){ return '<div class="panel"><h4>'+p.label+'</h4>'+imgHTML(p)+'</div>'; }
 
@@ -2407,6 +2474,7 @@ _COMPARATOR_TMPL = r"""
     countlbl.textContent = (ti+1) + " / " + DATES.length;
     slider.value = ti;
     stage.innerHTML = panelHTML(S[+left.value]) + panelHTML(S[+right.value]);
+    armFallback(stage);
   }
   function goto(i){ if(!DATES.length) return; ti = (i + DATES.length) % DATES.length; render(); }
 
